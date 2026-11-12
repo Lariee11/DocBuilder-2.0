@@ -19,7 +19,6 @@ SCL_NS = {"s": "http://www.iec.ch/61850/2003/SCL"}
 # ---------------------------------------------------------------------------
 
 LOGIC_OPERATORS = re.compile(r"\b(AND|OR|NOT|R_TRIG|F_TRIG)\b")
-VB_RE = re.compile(r"\bVB\d{3}\b")
 
 # Ajustes de grupo/global que são equações SELogic mesmo sem operadores
 LOGIC_KEYS = {"TR", "ULTRIP", "CL", "ULCL", "ER", "52A", "52B", "BLKCL", "TDURD_EQ"}
@@ -143,7 +142,6 @@ def parse_rdb(content: bytes) -> dict:
 def diff_logics(backup: dict, novo: dict):
     """Compara as lógicas de backup x novo e agrupa alterações idênticas entre grupos/lógicas."""
     changes = []      # linhas agregadas
-    settings_changes = {}  # ajustes não-lógicos alterados
     for relay in sorted(novo):
         new_sets = novo[relay]["settings"]
         old_sets = backup.get(relay, {}).get("settings", {})
@@ -162,8 +160,6 @@ def diff_logics(backup: dict, novo: dict):
                 if cls in LOGIC_CLASSES and is_logic_setting(cls, key, old_v, new_v):
                     sig = (key, norm_value(key, old_v), norm_value(key, new_v))
                     aggregated.setdefault(sig, {"key": key, "old": old_v, "new": new_v, "classes": []})["classes"].append(cls)
-                elif cls in ("1", "2", "3", "4", "G") and key in old_c:
-                    settings_changes.setdefault(relay, {}).setdefault((key, old_v, new_v), []).append(cls)
         for item in aggregated.values():
             old_expr, old_comment = split_equation(item["old"])
             new_expr, new_comment = split_equation(item["new"])
@@ -189,12 +185,7 @@ def diff_logics(backup: dict, novo: dict):
                 "old_comment": old_comment,
                 "comment": new_comment or old_comment,
             })
-    settings_list = []
-    for relay, items in settings_changes.items():
-        for (key, old_v, new_v), classes in items.items():
-            settings_list.append({"relay": relay, "setting": key, "scope": compress_classes(classes),
-                                  "old": old_v, "new": new_v})
-    return changes, settings_list
+    return changes
 
 
 def logic_rows(changes):
@@ -341,88 +332,6 @@ def goose_rows(entries):
             "Variável": e["variable"],
         })
     return rows
-
-
-def _goose_signature(e):
-    return (e["pub"], e["sub"], e["cb"], e["vb"], e["variable"])
-
-
-# ---------------------------------------------------------------------------
-# Cruzamento lógicas x GOOSE
-# ---------------------------------------------------------------------------
-
-def _relay_equations(relay_sets: dict):
-    """{variável: [(classe, equação)]} das classes de lógica do arquivo novo."""
-    eqs = {}
-    for cls in LOGIC_CLASSES:
-        for key, val in relay_sets.get(cls, {}).items():
-            expr, _ = split_equation(val)
-            if norm_value(key, expr):
-                eqs.setdefault(key, []).append((cls, expr))
-    return eqs
-
-
-def cross_check(novo_rdb: dict, scd: dict, entries):
-    warnings = []
-    usage = {}  # (ied scd, vb) -> lista de variáveis que usam o VB
-    rdb_by_norm = {normalize_name(r): r for r in novo_rdb}
-    scd_by_norm = {normalize_name(i): i for i in scd["ieds"]}
-
-    for n, r in rdb_by_norm.items():
-        if n not in scd_by_norm:
-            relay_eqs = _relay_equations(novo_rdb[r]["settings"])
-            uses_vb = any(VB_RE.search(e) for lst in relay_eqs.values() for _, e in lst)
-            if uses_vb:
-                warnings.append(f"{r}: usa virtual bits (VB) na lógica, mas não está no SCD.")
-    for n, i in scd_by_norm.items():
-        if n not in rdb_by_norm:
-            warnings.append(f"{i}: está no SCD, mas os ajustes dele não estão no .rdb novo (lógicas não verificadas).")
-
-    for n, ied in scd_by_norm.items():
-        relay = rdb_by_norm.get(n)
-        if not relay:
-            continue
-        eqs = _relay_equations(novo_rdb[relay]["settings"])
-        mapped = {e["vb"] for e in entries if e["sub"] == ied and e["vb"]}
-        used = {}
-        for var, lst in eqs.items():
-            for cls, expr in lst:
-                for vb in VB_RE.findall(expr):
-                    used.setdefault(vb, set()).add(var)
-        missing = []
-        for vb, variables in sorted(used.items()):
-            usage[(ied, vb)] = sorted(variables)
-            if vb not in mapped:
-                missing.append(f"{vb} ({', '.join(sorted(variables))})")
-        if missing:
-            warnings.append(f"{relay}: virtual bits usados na lógica mas não assinados no SCD (ficam sempre em 0): "
-                            f"{'; '.join(missing)}.")
-        unused = sorted(mapped - set(used))
-        if unused:
-            warnings.append(f"{relay}: virtual bits assinados no SCD mas não usados em nenhuma lógica: {', '.join(unused)}.")
-
-        # Variáveis SV publicadas por GOOSE que estão vazias (NA) na lógica do publicador
-        for e in entries:
-            if e["pub"] != ied or e["quality"] or not re.match(r"^SV\d+T$", e["raw_var"] or ""):
-                continue
-            sv = e["raw_var"][:-1]
-            if sv not in eqs:
-                warnings.append(f"{relay}: publica {e['raw_var']} por GOOSE, mas {sv} está vazia (NA) na lógica.")
-
-    # Quem publica mas não tem assinante
-    for e in entries:
-        if not e["sub"]:
-            warnings.append(f"{e['pub']}: publica {e['variable']} ({e['cb']}), mas nenhum IED do SCD assina esse sinal.")
-    for ied, info in scd["ieds"].items():
-        if not info["publications"] and not info["subscriptions"]:
-            warnings.append(f"{ied}: não publica nem assina nenhum GOOSE no SCD.")
-    # Remove duplicados mantendo ordem
-    seen, unique = set(), []
-    for w in warnings:
-        if w not in seen:
-            seen.add(w)
-            unique.append(w)
-    return unique, usage
 
 
 # ---------------------------------------------------------------------------
@@ -583,46 +492,16 @@ def signal_rows(changes):
 # Análise completa
 # ---------------------------------------------------------------------------
 
-def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes | None, novo_scd: bytes | None):
-    result = {"logic_changes": [], "settings_changes": [], "goose_entries": [], "goose_diff": {},
-              "warnings": [], "relays": {}, "ieds": {}, "vb_usage": {}, "dnp_changes": []}
+def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, novo_scd: bytes | None):
+    """Monta as linhas das tabelas de lógicas, GOOSE e sinalizações."""
+    result = {"logic_changes": [], "goose_entries": [], "dnp_changes": []}
 
     novo = parse_rdb(novo_rdb) if novo_rdb else {}
     backup = parse_rdb(backup_rdb) if backup_rdb else {}
     if novo:
-        changes, settings_list = diff_logics(backup, novo)
-        result["logic_changes"] = changes
-        result["_settings"] = {relay: data["settings"] for relay, data in novo.items()}
-        result["settings_changes"] = settings_list
-        for relay, data in novo.items():
-            old_info = backup.get(relay, {}).get("info", {})
-            result["relays"][relay] = {
-                "tipo": data["info"].get("RELAYTYPE", ""), "firmware": data["info"].get("FID", ""),
-                "versao_novo": data["info"].get("Version", ""), "versao_backup": old_info.get("Version", ""),
-                "no_backup": relay in backup,
-            }
-        for relay in backup:
-            if relay not in novo:
-                result["warnings"].append(f"{relay}: existe no .rdb de backup, mas não no .rdb novo.")
-
+        result["logic_changes"] = diff_logics(backup, novo)
     if novo_scd:
-        scd = parse_scd(novo_scd)
-        entries = goose_entries(scd)
-        result["goose_entries"] = entries
-        result["ieds"] = {name: {"tipo": i["type"], "ip": scd["comm"].get(name, {}).get("ip", ""),
-                                 "modelo_icd": i["configVersion"]} for name, i in scd["ieds"].items()}
-        if backup_scd:
-            old_entries = goose_entries(parse_scd(backup_scd))
-            old_sig = {_goose_signature(e) for e in old_entries}
-            new_sig = {_goose_signature(e) for e in entries}
-            result["goose_diff"] = {
-                "adicionados": [e for e in entries if _goose_signature(e) not in old_sig],
-                "removidos": [e for e in old_entries if _goose_signature(e) not in new_sig],
-            }
-        if novo:
-            warnings, usage = cross_check(novo, scd, entries)
-            result["warnings"].extend(warnings)
-            result["vb_usage"] = {f"{k[0]}|{k[1]}": v for k, v in usage.items()}
+        result["goose_entries"] = goose_entries(parse_scd(novo_scd))
 
     if novo:
         result["dnp_changes"] = diff_dnp(backup, novo, result["goose_entries"])
