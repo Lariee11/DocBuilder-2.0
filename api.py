@@ -1,4 +1,5 @@
 import os
+import logging
 import sys
 import json
 import tempfile
@@ -114,6 +115,7 @@ async def melhorar_texto(texto: str = Form(...)):
     try:
         resultado = await run_in_threadpool(improve_text, texto)
     except AIUnavailable as exc:
+        logging.getLogger("uvicorn.error").warning("Revisão do texto indisponível: %s", exc)
         raise HTTPException(status_code=503, detail=f"Não foi possível revisar o texto: {exc}.")
     return {"texto": resultado["texto"], "modelo": resultado["modelo"]}
 
