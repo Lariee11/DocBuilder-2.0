@@ -371,67 +371,6 @@ function Page2({ data, onChange }: { data: Page2; onChange: (d: Partial<Page2>) 
   )
 }
 
-// Descrição detalhada: revisada automaticamente (gramática e linguagem técnica) ao sair do campo
-function DetailedLogicField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
-  const [message, setMessage] = useState('')
-  const [original, setOriginal] = useState<string | null>(null)
-  const lastReviewed = useRef(value)
-
-  const review = async (text: string) => {
-    if (!text.trim() || text === lastReviewed.current) return
-    setStatus('loading')
-    setMessage('')
-    const formData = new FormData()
-    formData.append('texto', text)
-    try {
-      const response = await fetch('http://localhost:8000/melhorar-texto', { method: 'POST', body: formData })
-      const data = await response.json()
-      if (!response.ok) {
-        lastReviewed.current = text
-        setStatus('error')
-        setMessage(data.detail || 'Não foi possível revisar o texto.')
-        return
-      }
-      lastReviewed.current = data.texto
-      setOriginal(text)
-      onChange(data.texto)
-      setStatus('done')
-    } catch (err) {
-      console.error(err)
-      setStatus('error')
-      setMessage('Erro de conexão com o servidor local.')
-    }
-  }
-
-  const undo = () => {
-    if (original === null) return
-    lastReviewed.current = original
-    onChange(original)
-    setOriginal(null)
-    setStatus('idle')
-  }
-
-  return (
-    <Field label="Descrição Detalhada da Lógica" hint="Ao sair do campo, o texto é revisado automaticamente (gramática e linguagem técnica)">
-      <textarea value={value} readOnly={status === 'loading'}
-        placeholder="Descreva o que foi realizado e por quê. O texto será revisado sem alterar o conteúdo..."
-        onChange={(e) => { onChange(e.target.value); if (status === 'done') setStatus('idle') }}
-        rows={8} className={`${inputCls} leading-relaxed`} style={{ ...inputStyle, opacity: status === 'loading' ? 0.6 : 1 }}
-        onFocus={(e) => { e.target.style.borderColor = C.blue; e.target.style.boxShadow = `0 0 0 2px ${C.blueDim}` }}
-        onBlur={(e) => { e.target.style.borderColor = C.subtle; e.target.style.boxShadow = 'none'; review(e.target.value) }} />
-      {status === 'loading' && <span className="text-xs" style={{ color: C.blue }}>Revisando o texto...</span>}
-      {status === 'done' && (
-        <span className="text-xs flex items-center gap-2" style={{ color: C.green }}>
-          Texto revisado automaticamente.
-          <button onClick={undo} className="underline hover:opacity-80" style={{ color: C.blueLight }}>Desfazer</button>
-        </span>
-      )}
-      {status === 'error' && <span className="text-xs" style={{ color: '#fbbf24' }}>{message}</span>}
-    </Field>
-  )
-}
-
 function Page3({ data, onChange }: { data: Page3; onChange: (d: Partial<Page3>) => void }) {
   return (
     <div className="flex flex-col gap-8">
@@ -453,7 +392,14 @@ function Page3({ data, onChange }: { data: Page3; onChange: (d: Partial<Page3>) 
       <DynamicList label="Requisitos" hint="Funcionais e não funcionais"
         items={data.requirements} onChange={(items) => onChange({ requirements: items })} />
       <div style={{ borderTop: `1px solid ${C.divider}` }} />
-      <DetailedLogicField value={data.detailedLogic} onChange={(v) => onChange({ detailedLogic: v })} />
+      <Field label="Descrição Detalhada da Lógica" hint="Explicação técnica aprofundada">
+        <textarea value={data.detailedLogic}
+          placeholder="Detalhe a lógica técnica, decisões arquiteturais, fluxos de dados, algoritmos..."
+          onChange={(e) => onChange({ detailedLogic: e.target.value })}
+          rows={8} className={`${inputCls} leading-relaxed`} style={inputStyle}
+          onFocus={(e) => { e.target.style.borderColor = C.blue; e.target.style.boxShadow = `0 0 0 2px ${C.blueDim}` }}
+          onBlur={(e) => { e.target.style.borderColor = C.subtle; e.target.style.boxShadow = 'none' }} />
+      </Field>
     </div>
   )
 }

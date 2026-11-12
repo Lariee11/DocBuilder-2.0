@@ -143,7 +143,7 @@ def parse_rdb(content: bytes) -> dict:
 def diff_logics(backup: dict, novo: dict):
     """Compara as lógicas de backup x novo e agrupa alterações idênticas entre grupos/lógicas."""
     changes = []      # linhas agregadas
-    settings_changes = {}  # ajustes não-lógicos alterados (para contexto da IA)
+    settings_changes = {}  # ajustes não-lógicos alterados
     for relay in sorted(novo):
         new_sets = novo[relay]["settings"]
         old_sets = backup.get(relay, {}).get("settings", {})

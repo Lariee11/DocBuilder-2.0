@@ -103,9 +103,6 @@ def main():
         if subprocess.run([npm, "install"], cwd=ROOT, env=env).returncode != 0:
             sys.exit("[ERRO] Falha no npm install.")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[AVISO] ANTHROPIC_API_KEY não definida: a revisão automática da descrição ficará indisponível.")
-
     api = start("API", [python_executable(), "-m", "uvicorn", "api:app", "--reload", "--port", str(API_PORT)])
     web = start("WEB", [npm, "run", "dev"], env=env)
 

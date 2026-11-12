@@ -1,5 +1,4 @@
 import os
-import logging
 import sys
 import json
 import tempfile
@@ -8,13 +7,11 @@ import threading
 import webbrowser
 import uvicorn
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from backend_class import DocCreate
 import sel_analyzer
-from ai_describer import improve_text, AIUnavailable
 
 def resource_path(relative_path):
     """ Garante que o caminho funcione tanto no PyCharm quanto no .exe (PyInstaller) """
@@ -105,19 +102,6 @@ async def analisar_arquivos(
         "reles": analise["relays"],
         "ieds": analise["ieds"],
     }
-
-
-@app.post("/melhorar-texto")
-async def melhorar_texto(texto: str = Form(...)):
-    """Revisa a Descrição Detalhada (gramática e linguagem técnica) sem alterar o conteúdo."""
-    if not texto.strip():
-        raise HTTPException(status_code=400, detail="O texto está vazio.")
-    try:
-        resultado = await run_in_threadpool(improve_text, texto)
-    except AIUnavailable as exc:
-        logging.getLogger("uvicorn.error").warning("Revisão do texto indisponível: %s", exc)
-        raise HTTPException(status_code=503, detail=f"Não foi possível revisar o texto: {exc}.")
-    return {"texto": resultado["texto"], "modelo": resultado["modelo"]}
 
 
 # ==============================================================
