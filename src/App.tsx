@@ -371,6 +371,67 @@ function Page2({ data, onChange }: { data: Page2; onChange: (d: Partial<Page2>) 
   )
 }
 
+// Descrição detalhada: revisada automaticamente (gramática e linguagem técnica) ao sair do campo
+function DetailedLogicField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
+  const [message, setMessage] = useState('')
+  const [original, setOriginal] = useState<string | null>(null)
+  const lastReviewed = useRef(value)
+
+  const review = async (text: string) => {
+    if (!text.trim() || text === lastReviewed.current) return
+    setStatus('loading')
+    setMessage('')
+    const formData = new FormData()
+    formData.append('texto', text)
+    try {
+      const response = await fetch('http://localhost:8000/melhorar-texto', { method: 'POST', body: formData })
+      const data = await response.json()
+      if (!response.ok) {
+        lastReviewed.current = text
+        setStatus('error')
+        setMessage(data.detail || 'Não foi possível revisar o texto.')
+        return
+      }
+      lastReviewed.current = data.texto
+      setOriginal(text)
+      onChange(data.texto)
+      setStatus('done')
+    } catch (err) {
+      console.error(err)
+      setStatus('error')
+      setMessage('Erro de conexão com o servidor local.')
+    }
+  }
+
+  const undo = () => {
+    if (original === null) return
+    lastReviewed.current = original
+    onChange(original)
+    setOriginal(null)
+    setStatus('idle')
+  }
+
+  return (
+    <Field label="Descrição Detalhada da Lógica" hint="Ao sair do campo, o texto é revisado automaticamente (gramática e linguagem técnica)">
+      <textarea value={value} readOnly={status === 'loading'}
+        placeholder="Descreva o que foi realizado e por quê. O texto será revisado sem alterar o conteúdo..."
+        onChange={(e) => { onChange(e.target.value); if (status === 'done') setStatus('idle') }}
+        rows={8} className={`${inputCls} leading-relaxed`} style={{ ...inputStyle, opacity: status === 'loading' ? 0.6 : 1 }}
+        onFocus={(e) => { e.target.style.borderColor = C.blue; e.target.style.boxShadow = `0 0 0 2px ${C.blueDim}` }}
+        onBlur={(e) => { e.target.style.borderColor = C.subtle; e.target.style.boxShadow = 'none'; review(e.target.value) }} />
+      {status === 'loading' && <span className="text-xs" style={{ color: C.blue }}>Revisando o texto...</span>}
+      {status === 'done' && (
+        <span className="text-xs flex items-center gap-2" style={{ color: C.green }}>
+          Texto revisado automaticamente.
+          <button onClick={undo} className="underline hover:opacity-80" style={{ color: C.blueLight }}>Desfazer</button>
+        </span>
+      )}
+      {status === 'error' && <span className="text-xs" style={{ color: '#fbbf24' }}>{message}</span>}
+    </Field>
+  )
+}
+
 function Page3({ data, onChange }: { data: Page3; onChange: (d: Partial<Page3>) => void }) {
   return (
     <div className="flex flex-col gap-8">
@@ -392,14 +453,7 @@ function Page3({ data, onChange }: { data: Page3; onChange: (d: Partial<Page3>) 
       <DynamicList label="Requisitos" hint="Funcionais e não funcionais"
         items={data.requirements} onChange={(items) => onChange({ requirements: items })} />
       <div style={{ borderTop: `1px solid ${C.divider}` }} />
-      <Field label="Descrição Detalhada da Lógica" hint="Gerada na página Arquivos SEL ou escrita aqui. Use ### para subtítulos, - para listas e `código`">
-        <textarea value={data.detailedLogic}
-          placeholder="Detalhe a lógica técnica, decisões arquiteturais, fluxos de dados, algoritmos..."
-          onChange={(e) => onChange({ detailedLogic: e.target.value })}
-          rows={8} className={`${inputCls} leading-relaxed`} style={inputStyle}
-          onFocus={(e) => { e.target.style.borderColor = C.blue; e.target.style.boxShadow = `0 0 0 2px ${C.blueDim}` }}
-          onBlur={(e) => { e.target.style.borderColor = C.subtle; e.target.style.boxShadow = 'none' }} />
-      </Field>
+      <DetailedLogicField value={data.detailedLogic} onChange={(v) => onChange({ detailedLogic: v })} />
     </div>
   )
 }
@@ -436,11 +490,9 @@ function Page6({ annexes, onChange }: { annexes: Annex[]; onChange: (a: Annex[])
 type SelFileKey = 'rdb_backup' | 'rdb_novo' | 'scd_backup' | 'scd_novo'
 interface SelFiles { rdb_backup: File | null; rdb_novo: File | null; scd_backup: File | null; scd_novo: File | null }
 interface SelResult {
-  descricao: string
-  fonte_descricao: string
-  aviso_ia: string
   logica: TableRow[]
   goose: TableRow[]
+  sinalizacoes: TableRow[]
   avisos: string[]
 }
 
@@ -484,14 +536,11 @@ function FileSlot({ label, hint, accept, required, file, onChange }: {
   )
 }
 
-function SelImportPage({ context, onContextChange, hasExistingData, onResult }: {
-  context: string
-  onContextChange: (v: string) => void
+function SelImportPage({ hasExistingData, onResult }: {
   hasExistingData: boolean
   onResult: (r: SelResult) => void
 }) {
   const [files, setFiles] = useState<SelFiles>({ rdb_backup: null, rdb_novo: null, scd_backup: null, scd_novo: null })
-  const [useAi, setUseAi] = useState(true)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<SelResult | null>(null)
@@ -501,12 +550,10 @@ function SelImportPage({ context, onContextChange, hasExistingData, onResult }: 
       setError('Selecione pelo menos o arquivo .rdb novo.')
       return
     }
-    if (hasExistingData && !confirm('As tabelas de Lógica/GOOSE e a Descrição Detalhada atuais serão substituídas. Continuar?')) return
+    if (hasExistingData && !confirm('As tabelas de Lógicas, GOOSE e Sinalizações atuais serão substituídas. Continuar?')) return
     setError('')
     setLoading(true)
     const formData = new FormData()
-    formData.append('contexto', context)
-    formData.append('usar_ia', useAi ? 'true' : 'false')
     ;(Object.keys(files) as SelFileKey[]).forEach((k) => { if (files[k]) formData.append(k, files[k] as File) })
     try {
       const response = await fetch('http://localhost:8000/analisar-arquivos', { method: 'POST', body: formData })
@@ -534,21 +581,7 @@ function SelImportPage({ context, onContextChange, hasExistingData, onResult }: 
         ))}
       </div>
 
-      <Field label="Contexto" hint="Objetivo da alteração, equipamentos envolvidos, filosofia de proteção">
-        <textarea value={context}
-          placeholder="Ex.: Implantação de trip de transferência via GOOSE. A proteção do transformador T1 (SEL-787) envia trip para os alimentadores 52-2 e 52-3, que repassam o disparo ao 52-9..."
-          onChange={(e) => onContextChange(e.target.value)}
-          rows={7} className={`${inputCls} leading-relaxed`} style={inputStyle}
-          onFocus={(e) => { e.target.style.borderColor = C.blue; e.target.style.boxShadow = `0 0 0 2px ${C.blueDim}` }}
-          onBlur={(e) => { e.target.style.borderColor = C.subtle; e.target.style.boxShadow = 'none' }} />
-      </Field>
-
-      <div className="flex items-center justify-between gap-4 flex-wrap">
-        <label className="flex items-center gap-2 text-xs cursor-pointer select-none" style={{ color: C.text }}>
-          <input type="checkbox" checked={useAi} onChange={(e) => setUseAi(e.target.checked)} />
-          Gerar descrição com IA (Claude)
-          <span style={{ color: C.muted }}>- sem IA, a descrição é montada automaticamente a partir dos dados</span>
-        </label>
+      <div className="flex justify-end">
         <button onClick={analyze} disabled={loading}
           className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold transition-all hover:opacity-90 active:scale-95 disabled:opacity-50 disabled:cursor-wait"
           style={{ background: C.green, color: '#0b1122' }}>
@@ -563,10 +596,9 @@ function SelImportPage({ context, onContextChange, hasExistingData, onResult }: 
       {result && (
         <div className="flex flex-col gap-3 rounded-lg p-4" style={{ background: '#0b1122', border: `1px solid ${C.greenBorder}` }}>
           <p className="text-xs" style={{ color: C.green }}>
-            {result.logica.length} lógica(s) e {result.goose.length} sinal(is) GOOSE adicionados nas tabelas da página "Lógica & GOOSE".
-            Descrição detalhada ({result.fonte_descricao}) preenchida na página "Conteúdo".
+            {result.logica.length} lógica(s) e {result.goose.length} sinal(is) GOOSE adicionados na página "Lógica & GOOSE";
+            {' '}{result.sinalizacoes.length} ponto(s) novo(s) do mapa DNP adicionados em "Sinalizações" (página "Sinais & Testes").
           </p>
-          {result.aviso_ia && <p className="text-xs" style={{ color: '#fbbf24' }}>{result.aviso_ia}</p>}
           {result.avisos.length > 0 && (
             <div className="flex flex-col gap-1">
               <span className="text-xs font-semibold tracking-widest uppercase" style={{ color: '#fbbf24' }}>Pontos de atenção</span>
@@ -586,7 +618,7 @@ const PAGES = [
   { num: 1, title: 'Configuração', sub: 'Metadados do documento' },
   { num: 2, title: 'Autoria', sub: 'Responsáveis e revisão' },
   { num: 3, title: 'Conteúdo', sub: 'Seções técnicas' },
-  { num: 4, title: 'Arquivos SEL', sub: '.rdb, .scd e contexto' },
+  { num: 4, title: 'Arquivos SEL', sub: 'Leitura dos .rdb e .scd' },
   { num: 5, title: 'Lógica & GOOSE', sub: 'Adaptações e matriz' },
   { num: 6, title: 'Sinais & Testes', sub: 'Sinalizações e validação' },
   { num: 7, title: 'Anexos', sub: 'Imagens e arquivos' },
@@ -686,18 +718,17 @@ export default function App() {
     testes: { columns: ['ID', 'Cenário', 'Resultado Esperado'], rows: [] as TableRow[] },
   })
   const [annexes, setAnnexes] = useState<Annex[]>([])
-  const [selContext, setSelContext] = useState('')
 
   const handleSelResult = (r: SelResult) => {
     setPage4((p) => ({ logica: { ...p.logica, rows: r.logica }, goose: { ...p.goose, rows: r.goose } }))
-    setPage3((p) => ({ ...p, detailedLogic: r.descricao }))
+    setPage5((p) => ({ ...p, sinalizacoes: { ...p.sinalizacoes, rows: r.sinalizacoes } }))
   }
 
   const pageMeta: Record<number, { title: string; sub: string }> = {
     1: { title: 'Configuração do Documento', sub: 'Metadados e caminhos de compilação' },
     2: { title: 'Autoria e Revisão', sub: 'Distribuidora, responsável e controle de versão' },
     3: { title: 'Conteúdo Técnico', sub: 'Referências, objetivos, escopo e lógica' },
-    4: { title: 'Arquivos SEL', sub: 'Gera as tabelas e a descrição a partir dos .rdb, .scd e do contexto' },
+    4: { title: 'Arquivos SEL', sub: 'Preenche as tabelas de lógicas, GOOSE e sinalizações a partir dos .rdb e .scd' },
     5: { title: 'Lógica & Matriz GOOSE', sub: 'Adaptações lógicas e publicações GOOSE' },
     6: { title: 'Sinalizações & Testes', sub: 'Pontos de sinalização e validação' },
     7: { title: 'Anexos', sub: 'Imagens e documentos complementares' },
@@ -730,7 +761,6 @@ export default function App() {
           detailedLogic: data["Descrição Detalhada"] || ''
         })
 
-        setSelContext(data["Contexto"] || '')
         if (data["Adaptações Lógicas"]) setPage4(p => ({ ...p, logica: { ...p.logica, rows: data["Adaptações Lógicas"] } }))
         if (data["Matriz GOOSE"]) setPage4(p => ({ ...p, goose: { ...p.goose, rows: data["Matriz GOOSE"] } }))
         if (data["Sinalizações"]) setPage5(p => ({ ...p, sinalizacoes: { ...p.sinalizacoes, rows: data["Sinalizações"] } }))
@@ -760,7 +790,6 @@ export default function App() {
       "Escopo do Projeto": page3.projectScope.map(i => i.value),
       "Requisitos": page3.requirements.map(i => i.value),
       "Descrição Detalhada": page3.detailedLogic,
-      "Contexto": selContext,
       "Adaptações Lógicas": page4.logica.rows,
       "Matriz GOOSE": page4.goose.rows,
       "Sinalizações": page5.sinalizacoes.rows,
@@ -840,8 +869,8 @@ export default function App() {
             {currentPage === 2 && <Page2 data={page2} onChange={(d) => setPage2((p) => ({ ...p, ...d }))} />}
             {currentPage === 3 && <Page3 data={page3} onChange={(d) => setPage3((p) => ({ ...p, ...d }))} />}
             {currentPage === 4 && (
-              <SelImportPage context={selContext} onContextChange={setSelContext} onResult={handleSelResult}
-                hasExistingData={page4.logica.rows.length > 0 || page4.goose.rows.length > 0 || page3.detailedLogic.trim() !== ''} />
+              <SelImportPage onResult={handleSelResult}
+                hasExistingData={page4.logica.rows.length > 0 || page4.goose.rows.length > 0 || page5.sinalizacoes.rows.length > 0} />
             )}
             {currentPage === 5 && <Page4 data={page4} onChange={(d) => setPage4((p) => ({ ...p, ...d }))} />}
             {currentPage === 6 && <Page5 data={page5} onChange={(d) => setPage5((p) => ({ ...p, ...d }))} />}

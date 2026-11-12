@@ -426,12 +426,166 @@ def cross_check(novo_rdb: dict, scd: dict, entries):
 
 
 # ---------------------------------------------------------------------------
+# Mapa DNP
+# ---------------------------------------------------------------------------
+
+DNP_TYPES = {
+    "BI": "Entrada binária (BI)",
+    "BO": "Saída binária (BO)",
+    "AI": "Entrada analógica (AI)",
+    "AO": "Saída analógica (AO)",
+    "CO": "Contador (CO)",
+}
+
+# Descrições de elementos e grandezas comuns dos relés SEL
+KNOWN_SIGNALS = [
+    (r"^52A$", "Disjuntor fechado"),
+    (r"^52B$", "Disjuntor aberto"),
+    (r"^OC\d?$", "Comando de abertura do disjuntor"),
+    (r"^CC\d?$", "Comando de fechamento do disjuntor"),
+    (r"^TRIP$", "Disparo do relé"),
+    (r"^IN(\d{3})$", "Entrada digital {0}"),
+    (r"^OUT(\d{3})$", "Saída digital {0}"),
+    (r"^RB(\d+)$", "Bit remoto {0}"),
+    (r"^PB(\d+)$", "Botão {0} do painel frontal"),
+    (r"^SG(\d)$", "Grupo de ajuste {0} ativo"),
+    (r"^3PWR(\d)P$", "Elemento de potência trifásica nível {0} (32)"),
+    (r"^(\d)?PWR(\d)T$", "Disparo do elemento de potência nível {1} (32)"),
+    (r"^79RS$", "Religador em reset"),
+    (r"^79CY$", "Religador em ciclo"),
+    (r"^79LO$", "Religador bloqueado"),
+    (r"^(50|51|67)([PNGQ]|[ABC])(\d)?([PT])$", "Elemento {0}{1}{2} {3}"),
+    (r"^I([ABCGN])_MAG$", "Corrente da fase {0}"),
+    (r"^I([ABCGN])_ANG$", "Ângulo da corrente {0}"),
+    (r"^V([ABC]{1,2}|S)_MAG$", "Tensão {0}"),
+    (r"^V([ABC]{1,2}|S)_ANG$", "Ângulo da tensão {0}"),
+    (r"^P(_F)?$", "Potência ativa trifásica"),
+    (r"^Q(_F)?$", "Potência reativa trifásica"),
+    (r"^S(_F)?$", "Potência aparente trifásica"),
+    (r"^PF(_F)?$", "Fator de potência"),
+    (r"^FREQ$", "Frequência"),
+    (r"^MV(\d+)$", "Variável matemática {0}"),
+]
+PICKUP_OR_TRIP = {"P": "(partida)", "T": "(disparo)"}
+
+
+def _comment_map(relay_sets: dict):
+    """{variável: comentário} a partir das lógicas do relé (SVnn, SETnn->LTnn, MVnn, ...)."""
+    own, users = {}, {}
+    for cls in LOGIC_CLASSES:
+        for key, val in relay_sets.get(cls, {}).items():
+            expr, comment = split_equation(val)
+            if not comment or not norm_value(key, expr):
+                continue
+            m = re.match(r"^SET(\d+)$", key)
+            target = f"LT{m.group(1)}" if m else key
+            own.setdefault(target, comment)
+            for token in re.findall(r"\b[A-Z0-9_]+\b", expr):
+                users.setdefault(token, comment)
+    return own, users
+
+
+def _signal_description(var: str, own: dict, users: dict, goose_by_vb: dict) -> str:
+    base = var[:-1] if re.match(r"^SV\d+T$", var) else var
+    if base in own:
+        return own[base]
+    if var in goose_by_vb:
+        return goose_by_vb[var]
+    for pattern, text in KNOWN_SIGNALS:
+        m = re.match(pattern, var)
+        if m:
+            groups = [g or "" for g in m.groups()]
+            if pattern.startswith("^(50|51|67)"):
+                return f"Elemento {groups[0]}{groups[1]}{groups[2]} {PICKUP_OR_TRIP.get(groups[3], '')}".strip()
+            desc = text.format(*groups)
+            if re.match(r"^(RB|PB|IN|OUT)\d", var) and var in users:
+                desc += f" - {users[var]}"
+            return desc
+    if var in users:
+        return f"Usado na lógica: {users[var]}"
+    return ""
+
+
+def _dnp_value(value: str):
+    """'IA_MAG:10.000:5' -> ('IA_MAG', 'escala 10.000, banda morta 5')."""
+    parts = (value or "").split(":")
+    extra = []
+    if len(parts) > 1 and parts[1]:
+        extra.append(f"escala {parts[1]}")
+    if len(parts) > 2 and parts[2]:
+        extra.append(f"banda morta {parts[2]}")
+    return parts[0].strip(), ", ".join(extra)
+
+
+def diff_dnp(backup: dict, novo: dict, goose: list):
+    """Pontos dos mapas DNP (D1, D2, ...) que receberam uma variável nova em relação ao backup."""
+    changes = []
+    for relay in sorted(novo):
+        new_sets = novo[relay]["settings"]
+        old_sets = backup.get(relay, {}).get("settings", {})
+        own, users = _comment_map(new_sets)
+        goose_by_vb = {}
+        for e in goose:
+            if e["sub"] and normalize_name(e["sub"]) == normalize_name(relay) and e["vb"]:
+                goose_by_vb[e["vb"]] = (f"Falha de comunicação GOOSE com {e['pub']}" if e["quality"]
+                                        else f"Recebido por GOOSE de {e['pub']}: {e['raw_var'] or e['variable']}")
+        aggregated = {}
+        for cls in sorted(c for c in new_sets if re.match(r"^D\d+$", c)):
+            old_c = old_sets.get(cls, {})
+            for key, value in new_sets[cls].items():
+                m = re.match(r"^([A-Z]{2})_(\d+)$", key)
+                if not m:
+                    continue
+                var, extra = _dnp_value(value)
+                old_var, _ = _dnp_value(old_c.get(key, ""))
+                if norm_value(key, var) == "" or var == old_var:
+                    continue
+                sig = (m.group(1), int(m.group(2)), var, extra)
+                aggregated.setdefault(sig, []).append(cls[1:])
+        for (ptype, index, var, extra), maps in sorted(aggregated.items(), key=lambda x: (x[0][0], x[0][1])):
+            changes.append({"relay": relay, "type": ptype, "index": index, "variable": var, "extra": extra,
+                            "maps": maps, "description": _signal_description(var, own, users, goose_by_vb)})
+    return changes
+
+
+def signal_rows(changes):
+    rows = []
+    for c in changes:
+        maps = sorted(int(m) for m in c["maps"])
+        if len(maps) == 1:
+            maps_txt = f"mapa DNP {maps[0]}"
+        elif maps == list(range(maps[0], maps[-1] + 1)) and len(maps) > 2:
+            maps_txt = f"mapas DNP {maps[0]}–{maps[-1]}"
+        else:
+            maps_txt = "mapas DNP " + ", ".join(map(str, maps))
+        tipo = DNP_TYPES.get(c["type"], c["type"])
+        if c["type"] == "BI":
+            func = "Estado enviado ao supervisório (1 = ativo, 0 = inativo)."
+        elif c["type"] == "BO":
+            func = f"Comando do supervisório que aciona {c['variable']}."
+        elif c["type"] == "AI":
+            func = "Medição enviada ao supervisório" + (f" ({c['extra']})." if c["extra"] else ".")
+        elif c["type"] == "AO":
+            func = "Valor analógico recebido do supervisório."
+        else:
+            func = "Contador enviado ao supervisório."
+        rows.append({
+            "Equipamento": c["relay"],
+            "Tipo do Ponto": f"{tipo} - índice {c['index']} ({maps_txt})",
+            "Variável": c["variable"],
+            "Descrição": c["description"],
+            "Funcionamento": func,
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Análise completa
 # ---------------------------------------------------------------------------
 
 def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes | None, novo_scd: bytes | None):
     result = {"logic_changes": [], "settings_changes": [], "goose_entries": [], "goose_diff": {},
-              "warnings": [], "relays": {}, "ieds": {}, "vb_usage": {}, "equations": {}, "scd_to_rdb": {}}
+              "warnings": [], "relays": {}, "ieds": {}, "vb_usage": {}, "dnp_changes": []}
 
     novo = parse_rdb(novo_rdb) if novo_rdb else {}
     backup = parse_rdb(backup_rdb) if backup_rdb else {}
@@ -446,8 +600,6 @@ def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes 
                 "versao_novo": data["info"].get("Version", ""), "versao_backup": old_info.get("Version", ""),
                 "no_backup": relay in backup,
             }
-        result["equations"] = {r: {k: [e for _, e in v] for k, v in _relay_equations(d["settings"]).items()}
-                               for r, d in novo.items()}
         for relay in backup:
             if relay not in novo:
                 result["warnings"].append(f"{relay}: existe no .rdb de backup, mas não no .rdb novo.")
@@ -456,8 +608,6 @@ def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes 
         scd = parse_scd(novo_scd)
         entries = goose_entries(scd)
         result["goose_entries"] = entries
-        rdb_norm = {normalize_name(r): r for r in novo}
-        result["scd_to_rdb"] = {name: rdb_norm.get(normalize_name(name), name.replace("_", " ")) for name in scd["ieds"]}
         result["ieds"] = {name: {"tipo": i["type"], "ip": scd["comm"].get(name, {}).get("ip", ""),
                                  "modelo_icd": i["configVersion"]} for name, i in scd["ieds"].items()}
         if backup_scd:
@@ -473,151 +623,12 @@ def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes 
             result["warnings"].extend(warnings)
             result["vb_usage"] = {f"{k[0]}|{k[1]}": v for k, v in usage.items()}
 
+    if novo:
+        result["dnp_changes"] = diff_dnp(backup, novo, result["goose_entries"])
+
     result["logic_rows"] = logic_rows(result["logic_changes"])
+    result["signal_rows"] = signal_rows(result["dnp_changes"])
     result["goose_rows"] = goose_rows(result["goose_entries"])
     return result
 
 
-# ---------------------------------------------------------------------------
-# Descrição automática (sem IA)
-# ---------------------------------------------------------------------------
-
-def _join(names):
-    names = sorted(set(names))
-    if len(names) <= 1:
-        return "".join(names)
-    return ", ".join(names[:-1]) + " e " + names[-1]
-
-
-def _affected_by(eqs: dict, start_vars: set) -> set:
-    """Variáveis que dependem (direta ou indiretamente) de start_vars."""
-    affected = set(start_vars)
-    changed = True
-    while changed:
-        changed = False
-        for var, exprs in eqs.items():
-            if var in affected:
-                continue
-            for expr in exprs:
-                if any(re.search(rf"\b{re.escape(a)}T?\b", expr) for a in affected):
-                    affected.add(var)
-                    changed = True
-                    break
-    return affected
-
-
-def fallback_description(analysis: dict, context: str) -> str:
-    """Texto descritivo e curto, sem equações, montado a partir dos dados (usado quando a IA não está disponível)."""
-    paragraphs = []
-    if context.strip():
-        paragraphs.append(context.strip())
-
-    names = analysis.get("scd_to_rdb", {})
-    eq_all = analysis.get("equations", {})
-
-    def device(ied):
-        return names.get(ied, ied.replace("_", " "))
-
-    # GOOSE: o que cada publicador comanda nos assinantes
-    effects = {}  # (pub, efeito) -> assinantes
-    supervised = set()
-    for e in analysis["goose_entries"]:
-        if not e["sub"] or not e["vb"]:
-            continue
-        sub = device(e["sub"])
-        uses = set(analysis["vb_usage"].get(f"{e['sub']}|{e['vb']}", []))
-        if not uses:
-            continue
-        if e["quality"]:
-            supervised.add(sub)
-            continue
-        affected = _affected_by(eq_all.get(sub, {}), uses)
-        if "TR" in affected:
-            effect = "trip"
-        elif "CL" in affected:
-            effect = "bloqueio"
-        else:
-            effect = "sinal"
-        effects.setdefault((device(e["pub"]), effect), set()).add(sub)
-
-    goose_text = []
-    trips = {pub: subs for (pub, eff), subs in effects.items() if eff == "trip"}
-    if trips:
-        all_subs = set().union(*trips.values())
-        order = sorted(trips, key=lambda p: (p in all_subs, p))  # origem da cadeia primeiro
-        parts = [f"o {pub} comanda a abertura {'dos' if len(trips[pub]) > 1 else 'do'} {_join(trips[pub])}"
-                 for pub in order]
-        goose_text.append("Foi implementado o disparo por mensagens GOOSE: " + "; ".join(parts) + ". "
-                          "Assim, a falta é eliminada rapidamente e o equipamento defeituoso fica isolado, "
-                          "sem depender de fiação entre painéis.")
-    for (pub, eff), subs in sorted(effects.items()):
-        if eff == "bloqueio":
-            goose_text.append(f"O {pub} também envia a condição de bloqueio {'aos' if len(subs) > 1 else 'ao'} "
-                              f"{_join(subs)}, impedindo o "
-                              "religamento sobre o equipamento defeituoso até o rearme.")
-        elif eff == "sinal":
-            goose_text.append(f"O {pub} envia a {_join(subs)} informações de estado usadas em controle e sinalização.")
-    if supervised:
-        goose_text.append("Os relés receptores supervisionam a comunicação e desconsideram o sinal recebido em caso "
-                          "de falha, evitando atuações indevidas.")
-    if goose_text:
-        paragraphs.append(" ".join(goose_text))
-
-    # Lógicas alteradas, descritas por finalidade
-    changes = analysis["logic_changes"]
-    logic_text = []
-    by_relay = {}
-    for c in changes:
-        by_relay.setdefault(c["relay"], []).append(c)
-    gated, groups, leds = [], [], []
-    for relay, items in sorted(by_relay.items()):
-        if any(c["variable"] == "TR" and re.search(r"\bSG\d\b", c["new_expr"]) for c in items):
-            gated.append(relay)
-        if any(c["variable"].startswith("SS") for c in items):
-            n = sum(1 for c in items if c["variable"].startswith("SS") and c["new_expr"] not in ("0", "NA"))
-            groups.append((relay, n))
-        if any(c["variable"].endswith("_LED") for c in items):
-            leds.append(relay)
-    if gated:
-        logic_text.append(f"No{'s relés' if len(gated) > 1 else ''} {_join(gated)}, o disparo passou a depender do "
-                          "grupo de ajustes ativo, para que cada condição operativa use apenas a proteção adequada.")
-    for relay, n in groups:
-        logic_text.append(f"No {relay}, a seleção de grupos foi reorganizada"
-                          + (f" para {n} grupos" if n > 1 else "")
-                          + ", com escolha local ou remota"
-                          + (" e indicação no painel frontal" if relay in leds else "") + ".")
-    leds = [r for r in leds if r not in {g for g, _ in groups}]
-    if leds:
-        logic_text.append(f"A sinalização do painel frontal de {_join(leds)} passou a indicar o grupo de ajuste em uso.")
-    if logic_text:
-        paragraphs.append(" ".join(logic_text))
-
-    # Ajustes de proteção
-    settings = analysis["settings_changes"]
-    by_kind = {"relacao": set(), "sobrecorrente": set(), "potencia": set()}
-    for st in settings:
-        key = st["setting"]
-        if key in ("CTR", "CTRN", "PTR", "PTRS", "VNOM", "Z1MAG", "Z0MAG", "Z1ANG", "Z0ANG"):
-            by_kind["relacao"].add(st["relay"])
-        elif re.match(r"^(50|51|67)", key):
-            by_kind["sobrecorrente"].add(st["relay"])
-        elif key in ("EPWR", "3PWR1P", "3PWR2P", "PWR1T", "PWR2T"):
-            by_kind["potencia"].add(st["relay"])
-    set_text = []
-    items = []
-    if by_kind["relacao"]:
-        items.append(f"as relações de TC e TP e a tensão nominal ({_join(by_kind['relacao'])})")
-    if by_kind["sobrecorrente"]:
-        items.append(f"os ajustes de sobrecorrente ({_join(by_kind['sobrecorrente'])})")
-    if by_kind["potencia"]:
-        items.append(f"a função de potência ({_join(by_kind['potencia'])})")
-    if items:
-        set_text.append("Foram ainda revisados " + _join(items) if len(items) > 1 else "Foi ainda revisado " + items[0])
-        set_text[-1] += (", mantendo os grupos de ajuste coerentes com os equipamentos instalados e a "
-                         "coordenação com as proteções adjacentes.")
-    if set_text:
-        paragraphs.append(" ".join(set_text))
-
-    if len(paragraphs) == (1 if context.strip() else 0):
-        paragraphs.append("Não foram identificadas alterações de lógica ou de comunicação GOOSE entre os arquivos analisados.")
-    return "\n\n".join(paragraphs)

@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from backend_class import DocCreate
 import sel_analyzer
-from ai_describer import generate_description, AIUnavailable
+from ai_describer import improve_text, AIUnavailable
 
 def resource_path(relative_path):
     """ Garante que o caminho funcione tanto no PyCharm quanto no .exe (PyInstaller) """
@@ -79,14 +79,12 @@ async def gerar_documento(
 
 @app.post("/analisar-arquivos")
 async def analisar_arquivos(
-        contexto: str = Form(default=""),
-        usar_ia: str = Form(default="true"),
         rdb_backup: UploadFile | None = File(default=None),
         rdb_novo: UploadFile | None = File(default=None),
         scd_backup: UploadFile | None = File(default=None),
         scd_novo: UploadFile | None = File(default=None),
 ):
-    """Lê .rdb/.scd (backup e novo), monta as tabelas de lógicas e GOOSE e gera a descrição detalhada."""
+    """Lê .rdb/.scd (backup e novo) e monta as tabelas de lógicas, GOOSE e sinalizações (mapa DNP)."""
     async def ler(arquivo):
         return await arquivo.read() if arquivo is not None and arquivo.filename else None
 
@@ -98,33 +96,27 @@ async def analisar_arquivos(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    logica_rows = analise["logic_rows"]
-    descricao = None
-    fonte = "automática"
-    aviso_ia = ""
-    if usar_ia.lower() == "true":
-        try:
-            ia = await run_in_threadpool(generate_description, analise, contexto)
-            descricao = ia["descricao_detalhada"]
-            for row in logica_rows:
-                if row["id"] in ia["descricoes_logicas"]:
-                    row["Descrição"] = ia["descricoes_logicas"][row["id"]]
-            fonte = f"IA ({ia['modelo']})"
-        except AIUnavailable as exc:
-            aviso_ia = f"Descrição gerada sem IA: {exc}."
-    if not descricao:
-        descricao = sel_analyzer.fallback_description(analise, contexto)
-
     return {
-        "descricao": descricao,
-        "fonte_descricao": fonte,
-        "aviso_ia": aviso_ia,
-        "logica": [{k: v for k, v in row.items() if k != "id"} for row in logica_rows],
+        "logica": [{k: v for k, v in row.items() if k != "id"} for row in analise["logic_rows"]],
         "goose": analise["goose_rows"],
+        "sinalizacoes": analise["signal_rows"],
         "avisos": analise["warnings"],
         "reles": analise["relays"],
         "ieds": analise["ieds"],
     }
+
+
+@app.post("/melhorar-texto")
+async def melhorar_texto(texto: str = Form(...)):
+    """Revisa a Descrição Detalhada (gramática e linguagem técnica) sem alterar o conteúdo."""
+    if not texto.strip():
+        raise HTTPException(status_code=400, detail="O texto está vazio.")
+    try:
+        resultado = await run_in_threadpool(improve_text, texto)
+    except AIUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"Não foi possível revisar o texto: {exc}.")
+    return {"texto": resultado["texto"], "modelo": resultado["modelo"]}
+
 
 # ==============================================================
 # CONFIGURAÇÃO DO FRONTEND (REACT)
