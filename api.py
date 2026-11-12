@@ -6,11 +6,14 @@ import pathlib
 import threading
 import webbrowser
 import uvicorn
-from fastapi import FastAPI, Form, UploadFile, File
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from backend_class import DocCreate
+import sel_analyzer
+from ai_describer import generate_description, AIUnavailable
 
 def resource_path(relative_path):
     """ Garante que o caminho funcione tanto no PyCharm quanto no .exe (PyInstaller) """
@@ -29,7 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Usando o resource_path igual ao seu main.py original
+# Caminhos das imagens do cabeçalho (funciona no Python e no .exe gerado pelo PyInstaller)
 logo_eqtl_path_tex = pathlib.Path(resource_path(os.path.join("assets", "equatorial_logo.png"))).as_posix()
 logo_leao_at_path_tex = pathlib.Path(resource_path(os.path.join("assets", "Leao_AT.png"))).as_posix()
 
@@ -61,7 +64,7 @@ async def gerar_documento(
     doc.text_section("Objetivo", json_data['Objetivo'])
     doc.list_itemsize_section("Escopo do Projeto", json_data['Escopo do Projeto'])
     doc.sequence_section("Requisitos", json_data['Requisitos'])
-    doc.text_section("Descrição da Lógica", json_data['Descrição Detalhada'])
+    doc.rich_text_section("Descrição da Lógica", json_data['Descrição Detalhada'])
     doc.table_section("Adaptações Lógicas", "n", "", ["Equipamento", "Variável", "Equação Lógica", "Descrição"], json_data['Adaptações Lógicas'], 'ADAPTAÇÕES LÓGICAS')
     doc.table_section("Matriz GOOSE", 'y', "Sinais GOOSE", ["Publicador", "Assinante", "MAC Mensagem", "Virtual Bit", "Variável"], json_data['Matriz GOOSE'], 'MATRIZ GOOSE')
     doc.table_section("Sinalizações", 'y', "Sinais Utilizados", ["Equipamento", "Tipo do Ponto", "Variável", "Descrição", "Funcionamento"], json_data['Sinalizações'], 'SINALIZAÇÕES')
@@ -73,6 +76,55 @@ async def gerar_documento(
 
     pdf_filepath = os.path.join(temp_dir, f"{safe_filename}.pdf")
     return FileResponse(pdf_filepath, filename=f"{json_data['Nome do Arquivo']}.pdf")
+
+@app.post("/analisar-arquivos")
+async def analisar_arquivos(
+        contexto: str = Form(default=""),
+        usar_ia: str = Form(default="true"),
+        rdb_backup: UploadFile | None = File(default=None),
+        rdb_novo: UploadFile | None = File(default=None),
+        scd_backup: UploadFile | None = File(default=None),
+        scd_novo: UploadFile | None = File(default=None),
+):
+    """Lê .rdb/.scd (backup e novo), monta as tabelas de lógicas e GOOSE e gera a descrição detalhada."""
+    async def ler(arquivo):
+        return await arquivo.read() if arquivo is not None and arquivo.filename else None
+
+    if rdb_novo is None or not rdb_novo.filename:
+        raise HTTPException(status_code=400, detail="Envie pelo menos o arquivo .rdb novo.")
+    try:
+        analise = sel_analyzer.analyze(await ler(rdb_backup), await ler(rdb_novo),
+                                       await ler(scd_backup), await ler(scd_novo))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    logica_rows = analise["logic_rows"]
+    descricao = None
+    fonte = "automática"
+    aviso_ia = ""
+    if usar_ia.lower() == "true":
+        try:
+            ia = await run_in_threadpool(generate_description, analise, contexto)
+            descricao = ia["descricao_detalhada"]
+            for row in logica_rows:
+                if row["id"] in ia["descricoes_logicas"]:
+                    row["Descrição"] = ia["descricoes_logicas"][row["id"]]
+            fonte = f"IA ({ia['modelo']})"
+        except AIUnavailable as exc:
+            aviso_ia = f"Descrição gerada sem IA: {exc}."
+    if not descricao:
+        descricao = sel_analyzer.fallback_description(analise, contexto)
+
+    return {
+        "descricao": descricao,
+        "fonte_descricao": fonte,
+        "aviso_ia": aviso_ia,
+        "logica": [{k: v for k, v in row.items() if k != "id"} for row in logica_rows],
+        "goose": analise["goose_rows"],
+        "avisos": analise["warnings"],
+        "reles": analise["relays"],
+        "ieds": analise["ieds"],
+    }
 
 # ==============================================================
 # CONFIGURAÇÃO DO FRONTEND (REACT)

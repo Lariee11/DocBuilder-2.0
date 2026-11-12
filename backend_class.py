@@ -85,6 +85,63 @@ class DocCreate:
         with self.doc.create(Section(section_name)):
             self.doc.append(NoEscape(text))
 
+    def rich_text_section(self, section_name, text):
+        """ Cria uma seção a partir de texto simples formatado:
+            linhas '### Título' viram subseções, linhas '- item' viram listas,
+            `codigo` vira fonte monoespaçada e linhas em branco separam parágrafos.
+            Se o texto já contém comandos LaTeX, é inserido sem alterações (comportamento antigo). """
+        import re
+
+        text = text or ""
+        if re.search(r"\\[a-zA-Z]+", text):
+            self.text_section(section_name, text)
+            return
+
+        def inline(fragment):
+            parts = re.split(r"`([^`]+)`", fragment)
+            out = []
+            for i, part in enumerate(parts):
+                if i % 2:
+                    out.append(r"\texttt{" + sanitize(part) + "}")
+                else:
+                    out.append(sanitize(part))
+            return "".join(out)
+
+        latex = []
+        in_list = False
+        paragraph = []
+
+        def flush_paragraph():
+            if paragraph:
+                latex.append(inline(" ".join(paragraph)) + "\n\n")
+                paragraph.clear()
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            is_item = line.startswith("- ") or line.startswith("* ")
+            if in_list and not is_item:
+                latex.append(r"\end{itemize}" + "\n")
+                in_list = False
+            if not line:
+                flush_paragraph()
+            elif line.startswith("#"):
+                flush_paragraph()
+                latex.append(r"\subsection*{" + inline(line.lstrip("#").strip()) + "}\n")
+            elif is_item:
+                flush_paragraph()
+                if not in_list:
+                    latex.append(r"\begin{itemize}" + "\n")
+                    in_list = True
+                latex.append(r"\item " + inline(line[2:].strip()) + "\n")
+            else:
+                paragraph.append(line)
+        flush_paragraph()
+        if in_list:
+            latex.append(r"\end{itemize}" + "\n")
+
+        with self.doc.create(Section(section_name)):
+            self.doc.append(NoEscape(r"\sloppy" + "\n" + "".join(latex)))
+
     def table_section(self, section_name: str, tittle_y_or_n: str, table_title: str,
                       columns_names: list, lista_dicts: list, name_table: str):
         """ Cria uma seção com uma tabela longa que quebra de página nativamente sem bugs """

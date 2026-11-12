@@ -392,7 +392,7 @@ function Page3({ data, onChange }: { data: Page3; onChange: (d: Partial<Page3>) 
       <DynamicList label="Requisitos" hint="Funcionais e não funcionais"
         items={data.requirements} onChange={(items) => onChange({ requirements: items })} />
       <div style={{ borderTop: `1px solid ${C.divider}` }} />
-      <Field label="Descrição Detalhada da Lógica" hint="Explicação técnica aprofundada">
+      <Field label="Descrição Detalhada da Lógica" hint="Gerada na página Arquivos SEL ou escrita aqui. Use ### para subtítulos, - para listas e `código`">
         <textarea value={data.detailedLogic}
           placeholder="Detalhe a lógica técnica, decisões arquiteturais, fluxos de dados, algoritmos..."
           onChange={(e) => onChange({ detailedLogic: e.target.value })}
@@ -432,14 +432,164 @@ function Page6({ annexes, onChange }: { annexes: Annex[]; onChange: (a: Annex[])
   return <AnnexesSection annexes={annexes} onChange={onChange} />
 }
 
+// Importação dos arquivos SEL (.rdb / .scd)
+type SelFileKey = 'rdb_backup' | 'rdb_novo' | 'scd_backup' | 'scd_novo'
+interface SelFiles { rdb_backup: File | null; rdb_novo: File | null; scd_backup: File | null; scd_novo: File | null }
+interface SelResult {
+  descricao: string
+  fonte_descricao: string
+  aviso_ia: string
+  logica: TableRow[]
+  goose: TableRow[]
+  avisos: string[]
+}
+
+const SEL_FILE_SLOTS: { key: SelFileKey; label: string; hint: string; accept: string; required?: boolean }[] = [
+  { key: 'rdb_backup', label: 'Ajustes - Backup', hint: '.rdb antes das alterações', accept: '.rdb' },
+  { key: 'rdb_novo', label: 'Ajustes - Novo', hint: '.rdb com as lógicas desenvolvidas', accept: '.rdb', required: true },
+  { key: 'scd_backup', label: 'SCD - Backup', hint: '.scd antes das alterações (opcional)', accept: '.scd,.xml' },
+  { key: 'scd_novo', label: 'SCD - Novo', hint: '.scd com os GOOSEs implementados', accept: '.scd,.xml' },
+]
+
+function FileSlot({ label, hint, accept, required, file, onChange }: {
+  label: string; hint: string; accept: string; required?: boolean; file: File | null; onChange: (f: File | null) => void
+}) {
+  const ref = useRef<HTMLInputElement>(null)
+  return (
+    <div className="rounded-lg p-4 flex flex-col gap-2" style={{ background: '#0b1122', border: `1px solid ${file ? C.greenBorder : C.cardBorder}` }}>
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-xs font-semibold tracking-widest uppercase" style={{ color: C.blue }}>
+          {label}{required && <span style={{ color: C.green }}> *</span>}
+        </span>
+        <span className="text-xs" style={{ color: C.muted }}>{hint}</span>
+      </div>
+      <input ref={ref} type="file" accept={accept} className="hidden"
+        onChange={(e) => { onChange(e.target.files?.[0] ?? null); e.target.value = '' }} />
+      <div className="flex items-center gap-2">
+        <button onClick={() => ref.current?.click()}
+          className="text-xs px-2.5 py-1.5 rounded transition-all hover:opacity-80 shrink-0"
+          style={{ background: C.blueDim, border: `1px solid ${C.blueBorder}`, color: C.blue }}>
+          Selecionar arquivo
+        </button>
+        <span className="text-xs truncate" style={{ color: file ? C.text : C.muted, fontFamily: 'JetBrains Mono,monospace' }}>
+          {file ? file.name : 'Nenhum arquivo'}
+        </span>
+        {file && (
+          <button onClick={() => onChange(null)} className="ml-auto hover:text-red-400 transition-colors" style={{ color: C.muted }} title="Remover">
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M1 1l10 10M11 1L1 11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /></svg>
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function SelImportPage({ context, onContextChange, hasExistingData, onResult }: {
+  context: string
+  onContextChange: (v: string) => void
+  hasExistingData: boolean
+  onResult: (r: SelResult) => void
+}) {
+  const [files, setFiles] = useState<SelFiles>({ rdb_backup: null, rdb_novo: null, scd_backup: null, scd_novo: null })
+  const [useAi, setUseAi] = useState(true)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [result, setResult] = useState<SelResult | null>(null)
+
+  const analyze = async () => {
+    if (!files.rdb_novo) {
+      setError('Selecione pelo menos o arquivo .rdb novo.')
+      return
+    }
+    if (hasExistingData && !confirm('As tabelas de Lógica/GOOSE e a Descrição Detalhada atuais serão substituídas. Continuar?')) return
+    setError('')
+    setLoading(true)
+    const formData = new FormData()
+    formData.append('contexto', context)
+    formData.append('usar_ia', useAi ? 'true' : 'false')
+    ;(Object.keys(files) as SelFileKey[]).forEach((k) => { if (files[k]) formData.append(k, files[k] as File) })
+    try {
+      const response = await fetch('http://localhost:8000/analisar-arquivos', { method: 'POST', body: formData })
+      const data = await response.json()
+      if (!response.ok) {
+        setError(data.detail || 'Erro ao analisar os arquivos.')
+        return
+      }
+      setResult(data)
+      onResult(data)
+    } catch (err) {
+      console.error(err)
+      setError('Erro de conexão com o servidor local.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-7">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {SEL_FILE_SLOTS.map((slot) => (
+          <FileSlot key={slot.key} label={slot.label} hint={slot.hint} accept={slot.accept} required={slot.required} file={files[slot.key]}
+            onChange={(f) => setFiles((p) => ({ ...p, [slot.key]: f }))} />
+        ))}
+      </div>
+
+      <Field label="Contexto" hint="Objetivo da alteração, equipamentos envolvidos, filosofia de proteção">
+        <textarea value={context}
+          placeholder="Ex.: Implantação de trip de transferência via GOOSE. A proteção do transformador T1 (SEL-787) envia trip para os alimentadores 52-2 e 52-3, que repassam o disparo ao 52-9..."
+          onChange={(e) => onContextChange(e.target.value)}
+          rows={7} className={`${inputCls} leading-relaxed`} style={inputStyle}
+          onFocus={(e) => { e.target.style.borderColor = C.blue; e.target.style.boxShadow = `0 0 0 2px ${C.blueDim}` }}
+          onBlur={(e) => { e.target.style.borderColor = C.subtle; e.target.style.boxShadow = 'none' }} />
+      </Field>
+
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <label className="flex items-center gap-2 text-xs cursor-pointer select-none" style={{ color: C.text }}>
+          <input type="checkbox" checked={useAi} onChange={(e) => setUseAi(e.target.checked)} />
+          Gerar descrição com IA (Claude)
+          <span style={{ color: C.muted }}>- sem IA, a descrição é montada automaticamente a partir dos dados</span>
+        </label>
+        <button onClick={analyze} disabled={loading}
+          className="flex items-center gap-2 px-4 py-2 rounded text-sm font-semibold transition-all hover:opacity-90 active:scale-95 disabled:opacity-50 disabled:cursor-wait"
+          style={{ background: C.green, color: '#0b1122' }}>
+          {loading ? 'Analisando...' : 'Analisar e gerar tabelas'}
+        </button>
+      </div>
+
+      {error && (
+        <p className="text-xs rounded px-3 py-2" style={{ color: '#fca5a5', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)' }}>{error}</p>
+      )}
+
+      {result && (
+        <div className="flex flex-col gap-3 rounded-lg p-4" style={{ background: '#0b1122', border: `1px solid ${C.greenBorder}` }}>
+          <p className="text-xs" style={{ color: C.green }}>
+            {result.logica.length} lógica(s) e {result.goose.length} sinal(is) GOOSE adicionados nas tabelas da página "Lógica & GOOSE".
+            Descrição detalhada ({result.fonte_descricao}) preenchida na página "Conteúdo".
+          </p>
+          {result.aviso_ia && <p className="text-xs" style={{ color: '#fbbf24' }}>{result.aviso_ia}</p>}
+          {result.avisos.length > 0 && (
+            <div className="flex flex-col gap-1">
+              <span className="text-xs font-semibold tracking-widest uppercase" style={{ color: '#fbbf24' }}>Pontos de atenção</span>
+              <ul className="list-disc pl-5 flex flex-col gap-1">
+                {result.avisos.map((a, i) => <li key={i} className="text-xs" style={{ color: C.text }}>{a}</li>)}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // Sidebar
 const PAGES = [
   { num: 1, title: 'Configuração', sub: 'Metadados do documento' },
   { num: 2, title: 'Autoria', sub: 'Responsáveis e revisão' },
   { num: 3, title: 'Conteúdo', sub: 'Seções técnicas' },
-  { num: 4, title: 'Lógica & GOOSE', sub: 'Adaptações e matriz' },
-  { num: 5, title: 'Sinais & Testes', sub: 'Sinalizações e validação' },
-  { num: 6, title: 'Anexos', sub: 'Imagens e arquivos' },
+  { num: 4, title: 'Arquivos SEL', sub: '.rdb, .scd e contexto' },
+  { num: 5, title: 'Lógica & GOOSE', sub: 'Adaptações e matriz' },
+  { num: 6, title: 'Sinais & Testes', sub: 'Sinalizações e validação' },
+  { num: 7, title: 'Anexos', sub: 'Imagens e arquivos' },
 ]
 
 function Sidebar({ current, onNav, onGenerateDocs, onLoadJson }: {
@@ -536,14 +686,21 @@ export default function App() {
     testes: { columns: ['ID', 'Cenário', 'Resultado Esperado'], rows: [] as TableRow[] },
   })
   const [annexes, setAnnexes] = useState<Annex[]>([])
+  const [selContext, setSelContext] = useState('')
+
+  const handleSelResult = (r: SelResult) => {
+    setPage4((p) => ({ logica: { ...p.logica, rows: r.logica }, goose: { ...p.goose, rows: r.goose } }))
+    setPage3((p) => ({ ...p, detailedLogic: r.descricao }))
+  }
 
   const pageMeta: Record<number, { title: string; sub: string }> = {
     1: { title: 'Configuração do Documento', sub: 'Metadados e caminhos de compilação' },
     2: { title: 'Autoria e Revisão', sub: 'Distribuidora, responsável e controle de versão' },
     3: { title: 'Conteúdo Técnico', sub: 'Referências, objetivos, escopo e lógica' },
-    4: { title: 'Lógica & Matriz GOOSE', sub: 'Adaptações lógicas e publicações GOOSE' },
-    5: { title: 'Sinalizações & Testes', sub: 'Pontos de sinalização e validação' },
-    6: { title: 'Anexos', sub: 'Imagens e documentos complementares' },
+    4: { title: 'Arquivos SEL', sub: 'Gera as tabelas e a descrição a partir dos .rdb, .scd e do contexto' },
+    5: { title: 'Lógica & Matriz GOOSE', sub: 'Adaptações lógicas e publicações GOOSE' },
+    6: { title: 'Sinalizações & Testes', sub: 'Pontos de sinalização e validação' },
+    7: { title: 'Anexos', sub: 'Imagens e documentos complementares' },
   }
 
   const handleLoadJson = (file: File) => {
@@ -573,6 +730,7 @@ export default function App() {
           detailedLogic: data["Descrição Detalhada"] || ''
         })
 
+        setSelContext(data["Contexto"] || '')
         if (data["Adaptações Lógicas"]) setPage4(p => ({ ...p, logica: { ...p.logica, rows: data["Adaptações Lógicas"] } }))
         if (data["Matriz GOOSE"]) setPage4(p => ({ ...p, goose: { ...p.goose, rows: data["Matriz GOOSE"] } }))
         if (data["Sinalizações"]) setPage5(p => ({ ...p, sinalizacoes: { ...p.sinalizacoes, rows: data["Sinalizações"] } }))
@@ -602,6 +760,7 @@ export default function App() {
       "Escopo do Projeto": page3.projectScope.map(i => i.value),
       "Requisitos": page3.requirements.map(i => i.value),
       "Descrição Detalhada": page3.detailedLogic,
+      "Contexto": selContext,
       "Adaptações Lógicas": page4.logica.rows,
       "Matriz GOOSE": page4.goose.rows,
       "Sinalizações": page5.sinalizacoes.rows,
@@ -680,9 +839,13 @@ export default function App() {
             {currentPage === 1 && <Page1 data={page1} onChange={(d) => setPage1((p) => ({ ...p, ...d }))} />}
             {currentPage === 2 && <Page2 data={page2} onChange={(d) => setPage2((p) => ({ ...p, ...d }))} />}
             {currentPage === 3 && <Page3 data={page3} onChange={(d) => setPage3((p) => ({ ...p, ...d }))} />}
-            {currentPage === 4 && <Page4 data={page4} onChange={(d) => setPage4((p) => ({ ...p, ...d }))} />}
-            {currentPage === 5 && <Page5 data={page5} onChange={(d) => setPage5((p) => ({ ...p, ...d }))} />}
-            {currentPage === 6 && <Page6 annexes={annexes} onChange={setAnnexes} />}
+            {currentPage === 4 && (
+              <SelImportPage context={selContext} onContextChange={setSelContext} onResult={handleSelResult}
+                hasExistingData={page4.logica.rows.length > 0 || page4.goose.rows.length > 0 || page3.detailedLogic.trim() !== ''} />
+            )}
+            {currentPage === 5 && <Page4 data={page4} onChange={(d) => setPage4((p) => ({ ...p, ...d }))} />}
+            {currentPage === 6 && <Page5 data={page5} onChange={(d) => setPage5((p) => ({ ...p, ...d }))} />}
+            {currentPage === 7 && <Page6 annexes={annexes} onChange={setAnnexes} />}
           </div>
 
           {/* Nav buttons */}
