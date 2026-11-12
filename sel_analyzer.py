@@ -431,7 +431,7 @@ def cross_check(novo_rdb: dict, scd: dict, entries):
 
 def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes | None, novo_scd: bytes | None):
     result = {"logic_changes": [], "settings_changes": [], "goose_entries": [], "goose_diff": {},
-              "warnings": [], "relays": {}, "ieds": {}, "vb_usage": {}}
+              "warnings": [], "relays": {}, "ieds": {}, "vb_usage": {}, "equations": {}, "scd_to_rdb": {}}
 
     novo = parse_rdb(novo_rdb) if novo_rdb else {}
     backup = parse_rdb(backup_rdb) if backup_rdb else {}
@@ -446,6 +446,8 @@ def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes 
                 "versao_novo": data["info"].get("Version", ""), "versao_backup": old_info.get("Version", ""),
                 "no_backup": relay in backup,
             }
+        result["equations"] = {r: {k: [e for _, e in v] for k, v in _relay_equations(d["settings"]).items()}
+                               for r, d in novo.items()}
         for relay in backup:
             if relay not in novo:
                 result["warnings"].append(f"{relay}: existe no .rdb de backup, mas não no .rdb novo.")
@@ -454,6 +456,8 @@ def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes 
         scd = parse_scd(novo_scd)
         entries = goose_entries(scd)
         result["goose_entries"] = entries
+        rdb_norm = {normalize_name(r): r for r in novo}
+        result["scd_to_rdb"] = {name: rdb_norm.get(normalize_name(name), name.replace("_", " ")) for name in scd["ieds"]}
         result["ieds"] = {name: {"tipo": i["type"], "ip": scd["comm"].get(name, {}).get("ip", ""),
                                  "modelo_icd": i["configVersion"]} for name, i in scd["ieds"].items()}
         if backup_scd:
@@ -478,63 +482,142 @@ def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes 
 # Descrição automática (sem IA)
 # ---------------------------------------------------------------------------
 
+def _join(names):
+    names = sorted(set(names))
+    if len(names) <= 1:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " e " + names[-1]
+
+
+def _affected_by(eqs: dict, start_vars: set) -> set:
+    """Variáveis que dependem (direta ou indiretamente) de start_vars."""
+    affected = set(start_vars)
+    changed = True
+    while changed:
+        changed = False
+        for var, exprs in eqs.items():
+            if var in affected:
+                continue
+            for expr in exprs:
+                if any(re.search(rf"\b{re.escape(a)}T?\b", expr) for a in affected):
+                    affected.add(var)
+                    changed = True
+                    break
+    return affected
+
+
 def fallback_description(analysis: dict, context: str) -> str:
-    out = []
+    """Texto descritivo e curto, sem equações, montado a partir dos dados (usado quando a IA não está disponível)."""
+    paragraphs = []
     if context.strip():
-        out += ["### Contexto", context.strip(), ""]
+        paragraphs.append(context.strip())
 
+    names = analysis.get("scd_to_rdb", {})
+    eq_all = analysis.get("equations", {})
+
+    def device(ied):
+        return names.get(ied, ied.replace("_", " "))
+
+    # GOOSE: o que cada publicador comanda nos assinantes
+    effects = {}  # (pub, efeito) -> assinantes
+    supervised = set()
+    for e in analysis["goose_entries"]:
+        if not e["sub"] or not e["vb"]:
+            continue
+        sub = device(e["sub"])
+        uses = set(analysis["vb_usage"].get(f"{e['sub']}|{e['vb']}", []))
+        if not uses:
+            continue
+        if e["quality"]:
+            supervised.add(sub)
+            continue
+        affected = _affected_by(eq_all.get(sub, {}), uses)
+        if "TR" in affected:
+            effect = "trip"
+        elif "CL" in affected:
+            effect = "bloqueio"
+        else:
+            effect = "sinal"
+        effects.setdefault((device(e["pub"]), effect), set()).add(sub)
+
+    goose_text = []
+    trips = {pub: subs for (pub, eff), subs in effects.items() if eff == "trip"}
+    if trips:
+        all_subs = set().union(*trips.values())
+        order = sorted(trips, key=lambda p: (p in all_subs, p))  # origem da cadeia primeiro
+        parts = [f"o {pub} comanda a abertura {'dos' if len(trips[pub]) > 1 else 'do'} {_join(trips[pub])}"
+                 for pub in order]
+        goose_text.append("Foi implementado o disparo por mensagens GOOSE: " + "; ".join(parts) + ". "
+                          "Assim, a falta é eliminada rapidamente e o equipamento defeituoso fica isolado, "
+                          "sem depender de fiação entre painéis.")
+    for (pub, eff), subs in sorted(effects.items()):
+        if eff == "bloqueio":
+            goose_text.append(f"O {pub} também envia a condição de bloqueio {'aos' if len(subs) > 1 else 'ao'} "
+                              f"{_join(subs)}, impedindo o "
+                              "religamento sobre o equipamento defeituoso até o rearme.")
+        elif eff == "sinal":
+            goose_text.append(f"O {pub} envia a {_join(subs)} informações de estado usadas em controle e sinalização.")
+    if supervised:
+        goose_text.append("Os relés receptores supervisionam a comunicação e desconsideram o sinal recebido em caso "
+                          "de falha, evitando atuações indevidas.")
+    if goose_text:
+        paragraphs.append(" ".join(goose_text))
+
+    # Lógicas alteradas, descritas por finalidade
     changes = analysis["logic_changes"]
-    out.append("### Visão geral")
-    relays = sorted({c["relay"] for c in changes})
-    out.append(f"Foram identificadas {len(changes)} alterações de lógica em {len(relays)} relé(s)"
-               + (f" ({', '.join(relays)})" if relays else "")
-               + f" e {len(analysis['goose_entries'])} sinal(is) GOOSE configurado(s) no SCD.")
-    out.append("")
+    logic_text = []
+    by_relay = {}
+    for c in changes:
+        by_relay.setdefault(c["relay"], []).append(c)
+    gated, groups, leds = [], [], []
+    for relay, items in sorted(by_relay.items()):
+        if any(c["variable"] == "TR" and re.search(r"\bSG\d\b", c["new_expr"]) for c in items):
+            gated.append(relay)
+        if any(c["variable"].startswith("SS") for c in items):
+            n = sum(1 for c in items if c["variable"].startswith("SS") and c["new_expr"] not in ("0", "NA"))
+            groups.append((relay, n))
+        if any(c["variable"].endswith("_LED") for c in items):
+            leds.append(relay)
+    if gated:
+        logic_text.append(f"No{'s relés' if len(gated) > 1 else ''} {_join(gated)}, o disparo passou a depender do "
+                          "grupo de ajustes ativo, para que cada condição operativa use apenas a proteção adequada.")
+    for relay, n in groups:
+        logic_text.append(f"No {relay}, a seleção de grupos foi reorganizada"
+                          + (f" para {n} grupos" if n > 1 else "")
+                          + ", com escolha local ou remota"
+                          + (" e indicação no painel frontal" if relay in leds else "") + ".")
+    leds = [r for r in leds if r not in {g for g, _ in groups}]
+    if leds:
+        logic_text.append(f"A sinalização do painel frontal de {_join(leds)} passou a indicar o grupo de ajuste em uso.")
+    if logic_text:
+        paragraphs.append(" ".join(logic_text))
 
-    for relay in relays:
-        out.append(f"### Lógicas do {relay}")
-        for c in [c for c in changes if c["relay"] == relay]:
-            comment = f" - {c['comment']}" if c["comment"] else ""
-            if c["status"] == "Comentário alterado":
-                out.append(f"- `{c['variable']}` ({c['scope']}): equação `{c['new_expr']}` mantida, comentário alterado{comment}.")
-            elif c["status"] == "Nova":
-                out.append(f"- `{c['variable']}` ({c['scope']}): nova lógica `{c['new_expr']}`{comment}.")
-            elif c["status"] == "Removida":
-                out.append(f"- `{c['variable']}` ({c['scope']}): lógica removida (antes `{c['old_expr']}`).")
-            elif c["status"] == "Desabilitada":
-                out.append(f"- `{c['variable']}` ({c['scope']}): lógica desabilitada (`0`), antes `{c['old_expr']}`{comment}.")
-            else:
-                out.append(f"- `{c['variable']}` ({c['scope']}): alterada de `{c['old_expr']}` para `{c['new_expr']}`{comment}.")
-        rs = [s for s in analysis["settings_changes"] if s["relay"] == relay]
-        if rs:
-            out.append("")
-            out.append("Ajustes de proteção/configuração alterados:")
-            for s in rs[:40]:
-                out.append(f"- `{s['setting']}` ({s['scope']}): {s['old'] or 'NA'} para {s['new'] or 'NA'}.")
-            if len(rs) > 40:
-                out.append(f"- ... e mais {len(rs) - 40} ajuste(s).")
-        out.append("")
+    # Ajustes de proteção
+    settings = analysis["settings_changes"]
+    by_kind = {"relacao": set(), "sobrecorrente": set(), "potencia": set()}
+    for st in settings:
+        key = st["setting"]
+        if key in ("CTR", "CTRN", "PTR", "PTRS", "VNOM", "Z1MAG", "Z0MAG", "Z1ANG", "Z0ANG"):
+            by_kind["relacao"].add(st["relay"])
+        elif re.match(r"^(50|51|67)", key):
+            by_kind["sobrecorrente"].add(st["relay"])
+        elif key in ("EPWR", "3PWR1P", "3PWR2P", "PWR1T", "PWR2T"):
+            by_kind["potencia"].add(st["relay"])
+    set_text = []
+    items = []
+    if by_kind["relacao"]:
+        items.append(f"as relações de TC e TP e a tensão nominal ({_join(by_kind['relacao'])})")
+    if by_kind["sobrecorrente"]:
+        items.append(f"os ajustes de sobrecorrente ({_join(by_kind['sobrecorrente'])})")
+    if by_kind["potencia"]:
+        items.append(f"a função de potência ({_join(by_kind['potencia'])})")
+    if items:
+        set_text.append("Foram ainda revisados " + _join(items) if len(items) > 1 else "Foi ainda revisado " + items[0])
+        set_text[-1] += (", mantendo os grupos de ajuste coerentes com os equipamentos instalados e a "
+                         "coordenação com as proteções adjacentes.")
+    if set_text:
+        paragraphs.append(" ".join(set_text))
 
-    entries = analysis["goose_entries"]
-    if entries:
-        out.append("### Comunicação GOOSE")
-        for pub in sorted({e["pub"] for e in entries}):
-            for e in [e for e in entries if e["pub"] == pub]:
-                if not e["sub"]:
-                    out.append(f"- {pub} publica {e['variable']} na mensagem {e['cb']} (MAC {e['mac']}), sem assinante no SCD.")
-                    continue
-                usage = analysis["vb_usage"].get(f"{e['sub']}|{e['vb']}")
-                uso = f", usado em {', '.join(f'`{u}`' for u in usage)}" if usage else ""
-                out.append(f"- {pub} envia {e['variable']} ({e['cb']}, MAC {e['mac']}) para {e['sub']}, "
-                           f"recebido em `{e['vb']}`{uso}.")
-        diff = analysis.get("goose_diff") or {}
-        if diff.get("adicionados") or diff.get("removidos"):
-            out.append("")
-            out.append(f"Em relação ao SCD de backup: {len(diff.get('adicionados', []))} sinal(is) adicionado(s) "
-                       f"e {len(diff.get('removidos', []))} removido(s).")
-        out.append("")
-
-    if analysis["warnings"]:
-        out.append("### Pontos de atenção")
-        out += [f"- {w}" for w in analysis["warnings"]]
-    return "\n".join(out).strip()
+    if len(paragraphs) == (1 if context.strip() else 0):
+        paragraphs.append("Não foram identificadas alterações de lógica ou de comunicação GOOSE entre os arquivos analisados.")
+    return "\n\n".join(paragraphs)
