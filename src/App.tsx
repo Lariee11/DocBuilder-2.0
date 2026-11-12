@@ -433,9 +433,10 @@ function Page6({ annexes, onChange }: { annexes: Annex[]; onChange: (a: Annex[])
 }
 
 // Importação dos arquivos SEL (.rdb / .scd)
-type SelFileKey = 'rdb_backup' | 'rdb_novo' | 'scd_backup' | 'scd_novo'
-interface SelFiles { rdb_backup: File | null; rdb_novo: File | null; scd_backup: File | null; scd_novo: File | null }
+type SelFileKey = 'rdb_backup' | 'rdb_novo' | 'scd_backup' | 'scd_novo' | 'diagrama'
+interface SelFiles { rdb_backup: File | null; rdb_novo: File | null; scd_backup: File | null; scd_novo: File | null; diagrama: File | null }
 interface SelResult {
+  descricao: string
   logica: TableRow[]
   goose: TableRow[]
   sinalizacoes: TableRow[]
@@ -447,6 +448,7 @@ const SEL_FILE_SLOTS: { key: SelFileKey; label: string; hint: string; accept: st
   { key: 'rdb_novo', label: 'Ajustes - Novo', hint: '.rdb com as lógicas desenvolvidas', accept: '.rdb', required: true },
   { key: 'scd_backup', label: 'SCD - Backup', hint: '.scd antes das alterações (opcional)', accept: '.scd,.xml' },
   { key: 'scd_novo', label: 'SCD - Novo', hint: '.scd com os GOOSEs implementados', accept: '.scd,.xml' },
+  { key: 'diagrama', label: 'Diagrama de automação', hint: '.drawio - gera a Descrição Detalhada', accept: '.drawio,.xml' },
 ]
 
 function FileSlot({ label, hint, accept, required, file, onChange }: {
@@ -486,7 +488,7 @@ function SelImportPage({ hasExistingData, onResult }: {
   hasExistingData: boolean
   onResult: (r: SelResult) => void
 }) {
-  const [files, setFiles] = useState<SelFiles>({ rdb_backup: null, rdb_novo: null, scd_backup: null, scd_novo: null })
+  const [files, setFiles] = useState<SelFiles>({ rdb_backup: null, rdb_novo: null, scd_backup: null, scd_novo: null, diagrama: null })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<SelResult | null>(null)
@@ -496,7 +498,10 @@ function SelImportPage({ hasExistingData, onResult }: {
       setError('Selecione pelo menos o arquivo .rdb novo.')
       return
     }
-    if (hasExistingData && !confirm('As tabelas de Lógicas, GOOSE e Sinalizações atuais serão substituídas. Continuar?')) return
+    const msg = files.diagrama
+      ? 'As tabelas de Lógicas, GOOSE e Sinalizações e a Descrição Detalhada atuais serão substituídas. Continuar?'
+      : 'As tabelas de Lógicas, GOOSE e Sinalizações atuais serão substituídas. Continuar?'
+    if (hasExistingData && !confirm(msg)) return
     setError('')
     setLoading(true)
     const formData = new FormData()
@@ -544,6 +549,7 @@ function SelImportPage({ hasExistingData, onResult }: {
           <p className="text-xs" style={{ color: C.green }}>
             {result.logica.length} lógica(s) e {result.goose.length} sinal(is) GOOSE adicionados na página "Lógica & GOOSE";
             {' '}{result.sinalizacoes.length} ponto(s) novo(s) do mapa DNP adicionados em "Sinalizações" (página "Sinais & Testes").
+            {result.descricao && ' Descrição Detalhada gerada a partir do diagrama (página "Conteúdo").'}
           </p>
           {result.avisos.length > 0 && (
             <div className="flex flex-col gap-1">
@@ -564,7 +570,7 @@ const PAGES = [
   { num: 1, title: 'Configuração', sub: 'Metadados do documento' },
   { num: 2, title: 'Autoria', sub: 'Responsáveis e revisão' },
   { num: 3, title: 'Conteúdo', sub: 'Seções técnicas' },
-  { num: 4, title: 'Arquivos SEL', sub: 'Leitura dos .rdb e .scd' },
+  { num: 4, title: 'Arquivos SEL', sub: 'Relés, SCD e diagrama' },
   { num: 5, title: 'Lógica & GOOSE', sub: 'Adaptações e matriz' },
   { num: 6, title: 'Sinais & Testes', sub: 'Sinalizações e validação' },
   { num: 7, title: 'Anexos', sub: 'Imagens e arquivos' },
@@ -668,13 +674,14 @@ export default function App() {
   const handleSelResult = (r: SelResult) => {
     setPage4((p) => ({ logica: { ...p.logica, rows: r.logica }, goose: { ...p.goose, rows: r.goose } }))
     setPage5((p) => ({ ...p, sinalizacoes: { ...p.sinalizacoes, rows: r.sinalizacoes } }))
+    if (r.descricao) setPage3((p) => ({ ...p, detailedLogic: r.descricao }))
   }
 
   const pageMeta: Record<number, { title: string; sub: string }> = {
     1: { title: 'Configuração do Documento', sub: 'Metadados e caminhos de compilação' },
     2: { title: 'Autoria e Revisão', sub: 'Distribuidora, responsável e controle de versão' },
     3: { title: 'Conteúdo Técnico', sub: 'Referências, objetivos, escopo e lógica' },
-    4: { title: 'Arquivos SEL', sub: 'Preenche as tabelas de lógicas, GOOSE e sinalizações a partir dos .rdb e .scd' },
+    4: { title: 'Arquivos SEL', sub: 'Preenche as tabelas a partir dos .rdb e .scd e a descrição a partir do diagrama .drawio' },
     5: { title: 'Lógica & Matriz GOOSE', sub: 'Adaptações lógicas e publicações GOOSE' },
     6: { title: 'Sinalizações & Testes', sub: 'Pontos de sinalização e validação' },
     7: { title: 'Anexos', sub: 'Imagens e documentos complementares' },
@@ -816,7 +823,7 @@ export default function App() {
             {currentPage === 3 && <Page3 data={page3} onChange={(d) => setPage3((p) => ({ ...p, ...d }))} />}
             {currentPage === 4 && (
               <SelImportPage onResult={handleSelResult}
-                hasExistingData={page4.logica.rows.length > 0 || page4.goose.rows.length > 0 || page5.sinalizacoes.rows.length > 0} />
+                hasExistingData={page4.logica.rows.length > 0 || page4.goose.rows.length > 0 || page5.sinalizacoes.rows.length > 0 || page3.detailedLogic.trim() !== ''} />
             )}
             {currentPage === 5 && <Page4 data={page4} onChange={(d) => setPage4((p) => ({ ...p, ...d }))} />}
             {currentPage === 6 && <Page5 data={page5} onChange={(d) => setPage5((p) => ({ ...p, ...d }))} />}

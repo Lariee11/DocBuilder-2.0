@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from backend_class import DocCreate
 import sel_analyzer
+import diagram_reader
+import description_builder
 
 def resource_path(relative_path):
     """ Garante que o caminho funcione tanto no PyCharm quanto no .exe (PyInstaller) """
@@ -81,8 +83,10 @@ async def analisar_arquivos(
         rdb_novo: UploadFile | None = File(default=None),
         scd_backup: UploadFile | None = File(default=None),
         scd_novo: UploadFile | None = File(default=None),
+        diagrama: UploadFile | None = File(default=None),
 ):
-    """Lê .rdb/.scd (backup e novo) e monta as tabelas de lógicas, GOOSE e sinalizações (mapa DNP)."""
+    """Lê .rdb/.scd (backup e novo) e o diagrama .drawio; monta as tabelas de lógicas, GOOSE e sinalizações
+    (mapa DNP) e, com o diagrama, a descrição detalhada."""
     async def ler(arquivo):
         return await arquivo.read() if arquivo is not None and arquivo.filename else None
 
@@ -94,11 +98,23 @@ async def analisar_arquivos(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    descricao = ""
+    avisos = list(analise["warnings"])
+    conteudo_diagrama = await ler(diagrama)
+    if conteudo_diagrama:
+        try:
+            fatos = diagram_reader.interpret(diagram_reader.parse_drawio(conteudo_diagrama))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        descricao, avisos_diagrama = description_builder.build_description(analise, fatos)
+        avisos += avisos_diagrama
+
     return {
+        "descricao": descricao,
         "logica": [{k: v for k, v in row.items() if k != "id"} for row in analise["logic_rows"]],
         "goose": analise["goose_rows"],
         "sinalizacoes": analise["signal_rows"],
-        "avisos": analise["warnings"],
+        "avisos": avisos,
         "reles": analise["relays"],
         "ieds": analise["ieds"],
     }

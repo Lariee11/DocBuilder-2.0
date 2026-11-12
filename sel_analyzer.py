@@ -592,6 +592,7 @@ def analyze(backup_rdb: bytes | None, novo_rdb: bytes | None, backup_scd: bytes 
     if novo:
         changes, settings_list = diff_logics(backup, novo)
         result["logic_changes"] = changes
+        result["_settings"] = {relay: data["settings"] for relay, data in novo.items()}
         result["settings_changes"] = settings_list
         for relay, data in novo.items():
             old_info = backup.get(relay, {}).get("info", {})
